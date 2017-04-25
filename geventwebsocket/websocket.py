@@ -25,7 +25,7 @@ class WebSocket(object):
     """
 
     __slots__ = ('utf8validator', 'utf8validate_last', 'environ', 'closed',
-                 'stream', 'raw_write', 'raw_read', 'handler')
+                 'stream', 'raw_write', 'raw_read', 'handler', 'opcode', 'message')
 
     OPCODE_CONTINUATION = 0x00
     OPCODE_TEXT = 0x01
@@ -45,6 +45,9 @@ class WebSocket(object):
 
         self.utf8validator = Utf8Validator()
         self.handler = handler
+
+        self.opcode = None
+        self.message = ""
 
     def __del__(self):
         try:
@@ -308,6 +311,84 @@ class WebSocket(object):
             self.current_app.on_close(MSG_CLOSED)
 
         return None
+
+    def pv_read_message(self):
+        """
+        pv_read_message returns the control frames
+        """
+        while True:
+            header, payload = self.read_frame()
+            f_opcode = header.opcode
+
+            if f_opcode in (self.OPCODE_TEXT, self.OPCODE_BINARY):
+                # a new frame
+                if self.opcode:
+                    raise ProtocolError("The opcode in non-fin frame is "
+                                        "expected to be zero, got "
+                                        "{0!r}".format(f_opcode))
+
+                # Start reading a new message, reset the validator
+                self.utf8validator.reset()
+                self.utf8validate_last = (True, True, 0, 0)
+
+                self.opcode = f_opcode
+
+            elif f_opcode == self.OPCODE_CONTINUATION:
+                if not self.opcode:
+                    raise ProtocolError("Unexpected frame with opcode=0")
+
+            elif f_opcode == self.OPCODE_PING:
+                self.handle_ping(header, payload)
+                return f_opcode, payload
+
+            elif f_opcode == self.OPCODE_PONG:
+                self.handle_pong(header, payload)
+                return f_opcode, payload
+
+            elif f_opcode == self.OPCODE_CLOSE:
+                self.handle_close(header, payload)
+                return f_opcode, None
+
+            else:
+                raise ProtocolError("Unexpected opcode={0!r}".format(f_opcode))
+
+            if self.opcode == self.OPCODE_TEXT:
+                self.validate_utf8(payload)
+
+            self.message += payload
+
+            if header.fin:
+                break
+
+        if self.opcode == self.OPCODE_TEXT:
+            _message = self._decode_bytes(self.message)
+        else:
+            _message = self.message
+
+        _opcode = self.opcode
+        self.opcode = None
+        self.message = ""
+        return _opcode, _message
+
+    def pv_receive(self):
+        """
+        pv_receive returns the control frames
+        """
+        if self.closed:
+            self.current_app.on_close(MSG_ALREADY_CLOSED)
+            raise WebSocketError(MSG_ALREADY_CLOSED)
+
+        try:
+            return self.pv_read_message()
+        except UnicodeError as e:
+            self.close(1007)
+        except ProtocolError as e:
+            self.close(1002)
+        except error as e:
+            self.close()
+            self.current_app.on_close(MSG_CLOSED)
+
+        return None, None
 
     def send_frame(self, message, opcode):
         """
