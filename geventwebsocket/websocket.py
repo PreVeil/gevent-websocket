@@ -309,6 +309,79 @@ class WebSocket(object):
 
         return None
 
+    def pv_read_message(self):
+        opcode = None
+        message = ""
+
+        while True:
+            header, payload = self.read_frame()
+            f_opcode = header.opcode
+
+            if f_opcode in (self.OPCODE_TEXT, self.OPCODE_BINARY):
+                # a new frame
+                if opcode:
+                    raise ProtocolError("The opcode in non-fin frame is "
+                                        "expected to be zero, got "
+                                        "{0!r}".format(f_opcode))
+
+                # Start reading a new message, reset the validator
+                self.utf8validator.reset()
+                self.utf8validate_last = (True, True, 0, 0)
+
+                opcode = f_opcode
+
+            elif f_opcode == self.OPCODE_CONTINUATION:
+                if not opcode:
+                    raise ProtocolError("Unexpected frame with opcode=0")
+
+            elif f_opcode == self.OPCODE_PING:
+                self.handle_ping(header, payload)
+                return f_opcode, payload
+
+            elif f_opcode == self.OPCODE_PONG:
+                self.handle_pong(header, payload)
+                return f_opcode, payload
+
+            elif f_opcode == self.OPCODE_CLOSE:
+                self.handle_close(header, payload)
+                return f_opcode, u"Close frame received"
+
+            else:
+                raise ProtocolError("Unexpected opcode={0!r}".format(f_opcode))
+
+            if opcode == self.OPCODE_TEXT:
+                self.validate_utf8(payload)
+
+            message += payload
+
+            if header.fin:
+                break
+
+        if opcode == self.OPCODE_TEXT:
+            self.validate_utf8(message)
+            return opcode, self._decode_bytes(message)
+        else:
+            return opcode, message
+
+
+    def pv_receive(self):
+        if self.closed:
+            self.current_app.on_close(MSG_ALREADY_CLOSED)
+            raise WebSocketError(MSG_ALREADY_CLOSED)
+
+        try:
+            return self.pv_read_message()
+        except UnicodeError as e:
+            self.close(1007)
+            return self.OPCODE_CLOSE, e
+        except ProtocolError as e:
+            self.close(1002)
+            return self.OPCODE_CLOSE, e
+        except error as e:
+            self.close()
+            self.current_app.on_close(MSG_CLOSED)
+            return self.OPCODE_CLOSE, e
+
     def send_frame(self, message, opcode):
         """
         Send a frame over the websocket with message as its payload
